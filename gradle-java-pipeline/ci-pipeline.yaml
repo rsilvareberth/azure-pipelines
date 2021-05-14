@@ -1,0 +1,100 @@
+stages:
+
+- stage: UnitTest
+  displayName: Unit Test
+  jobs:
+  - job: UnitTest
+    displayName: Unit Test
+    pool:
+      vmImage: '$(vmImageAZ)'
+    steps:
+    - task: gitversion/setup@0
+      displayName: Install GitTools
+      inputs:
+        versionSpec: '5.6.8'
+    - task: gitversion/execute@0
+      displayName: Use GitVersion
+    - bash: |
+        echo "##vso[task.setvariable variable=HOME_DIRECTORY;]$HOME"
+      displayName: Set Variable
+    - task: Cache@2
+      displayName: Gradle Caches
+      inputs:
+        key: 'gradle | "$(Agent.OS)"'
+        path: $(GradleCache)
+    - script: |
+        ./gradlew --build-cache test -PartifactId=$(artifactId) -Pversion=$(version)  
+        ./gradlew --stop    
+      displayName: Build Test
+
+- stage: BuildandPublish
+  displayName: Build and Publish
+  dependsOn: UnitTest
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: BuildandPublish
+    displayName: Build and Publish
+    pool:
+      vmImage: '$(vmImageAZ)'
+    steps:
+    - task: gitversion/setup@0
+      displayName: Install GitTools
+      inputs:
+        versionSpec: '5.6.8'
+    - task: gitversion/execute@0
+      displayName: Use GitVersion
+    - task: Cache@2
+      inputs:
+        key: 'docker | cache'
+        path: /home/vsts/.docker
+        cacheHitVar: DOCKER_CACHE_HIT
+      displayName: Cache Docker images
+    - script: |
+        docker load -i /home/vsts/.docker/cache.tar
+      displayName: Restore Docker image
+      condition: and(not(canceled()), eq(variables.DOCKER_CACHE_HIT, 'true'))
+    - bash: |
+        echo "##vso[task.setvariable variable=HOME_DIRECTORY;]$HOME"
+      displayName: Set Variable
+    - task: Cache@2
+      displayName: Gradle Caches
+      inputs:
+        key: 'gradle | "$(Agent.OS)"'
+        path: $(GradleCache)
+    - script: |
+        ./gradlew --build-cache build -x test -PartifactId=$(artifactId) -Pversion=$(version) -Dquarkus.container-image.build=true -Dquarkus.container-image.group=$(containerRegistry) -Dquarkus.container-image.name=$(imageRepository)  
+        ./gradlew --stop    
+      displayName: Build
+    - task: Cache@2
+      inputs:
+        key: 'docker | cache'
+        path: /home/vsts/.docker
+        cacheHitVar: DOCKER_CACHE_HIT
+      displayName: Cache Docker images
+    - script: |
+        mkdir -p /home/vsts/.docker
+        docker image ls
+        docker save -o /home/vsts/.docker/cache.tar fabric8/java-alpine-openjdk11-jre
+      displayName: Save Docker image
+      condition: and(not(canceled()), or(failed(), ne(variables.DOCKER_CACHE_HIT, 'true')))
+    - script: |
+        ./gradlew --build-cache -PartifactId=$(artifactId) -Pversion=$(version) -PurlArtifactsMaven=$(urlArtifactsMaven) -PfeedArtifactsMaven=$(feedArtifactsMaven) -PuserPublish=$(organizationName) -PkeyPublish=$(accessTokenMaven) publish
+      displayName: Artifacts
+    - script: |
+        sudo docker tag '$(containerRegistry)/$(imageRepository):$(version)' '$(containerRegistry)/$(imageRepository)_hlg:$(version)-$(tag2)'
+        sudo docker tag '$(containerRegistry)/$(imageRepository):$(version)' '$(containerRegistry)/$(imageRepository)_hlg:latest'
+      displayName: Tagging
+    - task: Docker@2
+      displayName: Push ACR
+      inputs:
+        containerRegistry: '$(dockerRegistryServiceConnection)'
+        repository: '$(imageRepository)_hlg'
+        command: 'push'
+        tags: '$(version)-$(tag2)'
+    - task: Docker@2
+      displayName: Push ACR latest
+      inputs:
+        containerRegistry: '$(dockerRegistryServiceConnection)'
+        repository: '$(imageRepository)_hlg'
+        command: 'push'
+        tags: 'latest'
